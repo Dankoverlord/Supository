@@ -1,0 +1,147 @@
+#include <windows.h>
+#include <string>
+#include <filesystem>
+
+#include "../include/log.h"
+#include "../include/interop.h"
+
+namespace fs = std::experimental::filesystem;
+
+#define D5MOD_MOD_FOLDER_PATH "D5mod/mods/"
+
+#include "../include/MinHook.h"
+
+extern "C" 
+{ 
+    __declspec(dllexport) DWORD OnLoad(void*);
+
+    void ClientLogger(const char *msg);
+    void PatchBinary(void *dst, const uint8_t *src, uint32_t size);
+    bool SafePatchBinary(uint32_t rva, const uint8_t *check, const uint8_t *src, uint32_t size);
+    
+    uint64_t VaToRva(uint64_t va)
+    {
+        return (uint64_t)va - (uint64_t)GetModuleHandleA(NULL);
+    }
+
+    uint64_t RvaToVa(uint64_t rva)
+    {
+        return (uint64_t)rva + (uint64_t)GetModuleHandleA(NULL);
+    }
+
+    const char *ModDirectory() { return D5MOD_MOD_FOLDER_PATH; }
+}
+
+Log::File *logger;
+
+std::string _current_dll = "";
+void ClientLogger(const char *msg)
+{
+    logger->Log("[{}]: {}", _current_dll, msg);
+}
+
+class VPMem
+{
+public:
+    VPMem(LPVOID address, uint32_t memsize, DWORD protect) : addr(address), size(memsize)
+    { VirtualProtect(addr, size, protect, &old_protect); }
+    ~VPMem() { VirtualProtect(addr, size, old_protect, &old_protect); }
+
+private:
+    LPVOID addr;
+    uint32_t size;
+    DWORD old_protect;
+};
+
+void PatchBinary(uint32_t rva, const uint8_t *src, uint32_t size)
+{
+    LPVOID va = (LPVOID)RvaToVa(rva);
+
+    VPMem protect(va, size, PAGE_READWRITE);
+    memcpy(va, src, size);
+}
+
+bool ValidatePatch(uint32_t rva, const uint8_t *check, uint32_t size)
+{
+    LPVOID va = (LPVOID)RvaToVa(rva);
+
+    VPMem protect(va, size, PAGE_READWRITE);
+
+    const uint8_t* dst_chk = (const uint8_t*)va;
+    for (int i = 0; i < size; i++)
+        if (dst_chk[i] != check[i])
+            return false;
+    return true;
+}
+
+bool SafePatchBinary(uint32_t rva, const uint8_t *check, const uint8_t *src, uint32_t size)
+{
+    LPVOID va = (LPVOID)RvaToVa(rva);
+
+    if (!ValidatePatch(rva, check, size))
+        return false;
+
+    VPMem protect(va, size, PAGE_READWRITE);    
+    memcpy(va, src, size);
+    return true;
+}
+
+ClientOps_t _client_ops
+{
+    &ClientLogger,
+    &PatchBinary,
+    &ValidatePatch,
+    &SafePatchBinary,
+
+    &VaToRva,
+    &RvaToVa,
+
+    &ModDirectory,
+};
+
+void fatal_error(const std::string &s)
+{
+    MessageBoxA(NULL, s.c_str(), "Error", MB_ICONERROR | MB_OK);
+    exit(0);
+}
+
+void handle_dll(const std::string& path)
+{
+    HMODULE h = LoadLibraryA(path.c_str());
+    if (h == NULL)
+    {
+        logger->Log("Unable to load DLL \"{}\"! Skipping...", path);
+        return;
+    }
+    FARPROC f = GetProcAddress(h, "OnLoad");
+    if (f == NULL)
+    {
+        logger->Log("Unable to locate OnLoad export in DLL \"{}\"! Skipping...", path);
+        return;
+    }
+    auto onload = (void(*)(ClientOps_t*))f;
+    _current_dll = path;
+    onload(&_client_ops);
+}
+
+__declspec(dllexport) DWORD OnLoad(void *)
+{
+    logger = new Log::File("d5mod/launch.log");
+    if (!logger->valid())
+        fatal_error("Unable to open log file!");
+
+    fs::path mod_dir("d5mod/mods");
+    if (fs::exists(mod_dir) && !fs::is_directory(mod_dir))
+        fatal_error("Mod directory path leads to a file!");
+    if (!fs::exists(mod_dir))
+        fs::create_directories(mod_dir);
+
+    if (MH_Initialize() != MH_OK)
+        logger->Log("Failed to initalize MinHook! Hooks are non-functional.");
+    
+    for (auto& p : fs::directory_iterator(mod_dir))
+        if (p.path().extension() == ".dll")
+            handle_dll(p.path().string());
+    delete logger;
+    return 0;
+}
