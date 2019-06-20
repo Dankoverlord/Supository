@@ -1,0 +1,101 @@
+#pragma once
+#include <windows.h>
+#include <string>
+#include <psapi.h>
+
+#include <filesystem>
+namespace fs = std::experimental::filesystem;
+
+struct InjectData_t
+{
+    char dllpath[MAX_PATH];
+};
+
+std::string GetLastErrorAsString()
+{
+	//Get the error message, if any.
+	DWORD errorMessageID = ::GetLastError();
+	if (errorMessageID == 0)
+		return std::string(); //No error message has been recorded
+
+	LPSTR messageBuffer = nullptr;
+	size_t size = FormatMessageA(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+		NULL, errorMessageID, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), (LPSTR)&messageBuffer, 0, NULL);
+
+	std::string message(messageBuffer, size);
+
+	//Free the buffer.
+	LocalFree(messageBuffer);
+
+	return message;
+}
+
+// Injects a DLL at path into a given process.
+// Returns the handle of the injected module, NULL on failure. 
+std::string InjectDll(const std::string& path, HANDLE process, HMODULE *out)
+{
+    InjectData_t inject_data;
+    memcpy(inject_data.dllpath, path.c_str(), path.size() > MAX_PATH - 1 ? MAX_PATH - 1 : path.size());
+    inject_data.dllpath[MAX_PATH-1] = 0;
+
+    printf("Allocating space for injected data... ");
+    LPVOID remote_inject_data = VirtualAllocEx(
+                    process, 
+                    NULL, 
+                    sizeof(InjectData_t), 
+                    MEM_COMMIT | MEM_RESERVE,
+                    PAGE_READWRITE);
+    if (remote_inject_data == NULL)
+        return "Failed to allocate remote memory. Error Code: " + GetLastErrorAsString();
+
+    printf("OK\nWriting info to process... ");
+    if (WriteProcessMemory(process, remote_inject_data, &inject_data, sizeof(InjectData_t), NULL) == 0)
+        return "Failed to write to remote memory. Error Code: " + GetLastErrorAsString();
+
+    printf("OK\nSpawning LoadLibrary thread in remote process... ");
+    HANDLE llt = CreateRemoteThread(
+                    process,
+                    NULL,
+                    0,
+                    (LPTHREAD_START_ROUTINE)GetProcAddress(GetModuleHandleA("Kernel32"), "LoadLibraryA"),
+                    remote_inject_data,
+                    0,
+                    NULL);
+
+    if (llt == NULL)
+        return "Failed to Create Remote Thread. Error Code: "+GetLastErrorAsString();
+
+    printf("Waiting for thread to finish... ");
+    WaitForSingleObject(llt, INFINITE);
+    
+    HMODULE modules[512];
+    DWORD modulearr_size;
+    if (EnumProcessModules(process, modules, sizeof(HMODULE) * 512, &modulearr_size) == 0)
+        return "Failed to enumerate modules. Error Code: " + GetLastErrorAsString();
+    HMODULE rv = NULL;
+    std::string dllname = fs::path(path).filename().string();
+    std::transform(dllname.begin(), dllname.end(), dllname.begin(), ::tolower);
+    for (uint32_t i = 0; i < (modulearr_size / sizeof(HMODULE)); i++)
+    {
+        static char buf[256];
+        if (GetModuleBaseNameA(process, modules[i], buf, 256) == 0)
+            return "Failed to get base name of a module. Error Code: " + GetLastErrorAsString();
+        std::transform(&buf[0], &buf[255], &buf[0], ::tolower);
+        if (std::string(buf) == dllname)
+        {
+            rv = modules[i];
+            break;
+        }
+    }
+
+    CloseHandle(llt);
+    VirtualFreeEx(process, remote_inject_data, sizeof(InjectData_t), MEM_RELEASE);
+    
+    if (rv == NULL)
+        return "LoadLibrary failed.\n";
+    else
+        printf("OK.\n");
+    if (out)
+        *out = (HMODULE)rv;
+    return "";
+}
