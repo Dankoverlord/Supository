@@ -1,0 +1,170 @@
+#include <windows.h>
+#include <psapi.h>
+#include <stdio.h>
+#include <iostream>
+#include <fstream>
+#include <unordered_map>
+#include <regex>
+
+#include <filesystem>
+
+#include "inject.h"
+
+#define D5MOD_CONFIG_PATH "D5mod/d5mod.ini"
+
+namespace fs = std::experimental::filesystem;
+
+LPTHREAD_START_ROUTINE get_remote_proc_address(const std::string& path, const std::string& proc_name, const HMODULE& base)
+{
+    HMODULE m = LoadLibraryA(path.c_str());
+    if (m == NULL)
+        return nullptr;
+    
+    FARPROC proc = GetProcAddress(m, proc_name.c_str());
+    if (proc == NULL)
+        return nullptr;
+
+    return (LPTHREAD_START_ROUTINE)((uint64_t)base + (uint64_t)proc - (uint64_t)m);
+}
+
+std::string do_work(const PROCESS_INFORMATION &process)
+{
+    printf("Disgaea 5 process: %d\n", (int)process.hProcess);
+    ResumeThread(process.hThread);
+    printf("Waiting for process init to finish... ");
+    WaitForInputIdle(process.hProcess, INFINITE);
+    printf("OK\n");
+
+    SuspendThread(process.hThread);
+
+    printf("Getting base address of disgaea5 module... ");
+    HMODULE base_module;
+    DWORD needed_bytes;
+    if (EnumProcessModulesEx(process.hProcess, &base_module, sizeof(base_module), &needed_bytes, LIST_MODULES_64BIT) == 0)
+        return "Failed to enumerate processes.";
+
+    char base_name[64];
+    GetModuleBaseNameA(process.hProcess, base_module, base_name, 64);
+    printf("%s -> 0x%08x\n", base_name, (int)base_module);
+    
+    fs::path op_dll_path("D5mod/d5mod.dll");   
+    HMODULE mod_handle; 
+    std::string inject_error;
+    if (!(inject_error = InjectDll(op_dll_path.string(), process.hProcess, &mod_handle)).empty())
+        return inject_error;
+
+    // Since d5mod.dll is in the other process's address space, we can't just GetProcAddress for our starter function
+    // Instead, we'll also load it into our own and get the relative offset. Then we can calculate the location in the 
+    // other process and spawn a thread
+    // DEEP WIN32 SCUMBAGGERY
+    LPTHREAD_START_ROUTINE addr = get_remote_proc_address(op_dll_path.string(), "OnLoad", mod_handle);
+    if (addr == nullptr)
+        return "Unable to locate OnLoad in d5mod.dll!";
+    
+    HANDLE load_thread = CreateRemoteThread(
+        process.hProcess,
+        NULL,
+        0,
+        addr,
+        NULL,
+        0,
+        NULL);
+    if (load_thread == NULL)
+        return "Unable to create remote OnLoad thread!";
+    
+    WaitForSingleObject(load_thread, INFINITE);
+    CloseHandle(load_thread);
+    
+    printf("Resuming main thread.\n");
+    ResumeThread(process.hThread);
+    return "";
+}
+
+HANDLE _g_process = NULL;
+void fatal_error(const std::string& s) 
+{
+    MessageBoxA(NULL, s.c_str(), "Error", MB_ICONERROR | MB_OK);
+    if (_g_process != NULL)
+        TerminateProcess(_g_process, 0);
+    exit(0);
+}
+
+std::unordered_map<std::string, std::string> parse_config(std::istream& in)
+{
+    static std::regex r(R"(^\s*?(\S+?)\s*?=\s*(\S+)\s*$)");
+    std::unordered_map<std::string, std::string> rv;
+    std::string line;
+    while (std::getline(in, line))
+    {
+        // skip over lines starting with ; or #
+        bool skip = false;
+        for (auto& c : line)
+            if (c == ' ' || c == '\t')
+                continue;
+            else if (c == ';' || c == '#')
+                skip = true;
+            else
+                break;
+        if (skip)
+            continue;
+        
+        std::smatch m;
+        if (std::regex_search(line, m, r))
+        {
+            printf("Found pair {%s, %s}\n", m.str(1).c_str(), m.str(2).c_str());
+            std::string lcase(m.str(1).size(), 0);
+            std::transform(m.str(1).begin(), m.str(1).end(), lcase.begin(), ::tolower);
+            rv[lcase] = m.str(2);
+        }
+    }
+    return rv;
+}
+
+class ProcInfo_Cleaner
+{
+    PROCESS_INFORMATION& _p;
+public:
+    ProcInfo_Cleaner(PROCESS_INFORMATION& p) : _p(p) { }
+    ~ProcInfo_Cleaner()
+    {
+        CloseHandle(_p.hThread);
+        CloseHandle(_p.hProcess);
+    }
+};
+
+int main(int argc, char **argv)
+{
+    std::ifstream cfg_stream;
+    cfg_stream.open(D5MOD_CONFIG_PATH);
+    if (!cfg_stream)
+        fatal_error("Unable to open config file \"" D5MOD_CONFIG_PATH "\"!");
+    
+   // auto config_strings = parse_config(cfg_stream);
+   // if (config_strings.find("Target.Name") == config_strings.end())
+   //     fatal_error("Could not find key \"Target.Name\" in config file!");
+
+    STARTUPINFOA info = {sizeof(info)};
+    PROCESS_INFORMATION process;
+    if (!CreateProcessA(
+        //config_strings.at("Target.Name").c_str(),
+		"disgaea5.exe",
+        NULL,
+        NULL,
+        NULL,
+        TRUE,
+        CREATE_SUSPENDED | ABOVE_NORMAL_PRIORITY_CLASS,
+        NULL,
+        NULL,
+        &info,
+        &process
+    ))
+        fatal_error("Failed to create process!");
+    
+    _g_process = process.hProcess;
+    ProcInfo_Cleaner _cleaner(process);
+
+    std::string launch_error;
+    if (!(launch_error = do_work(process)).empty())
+        fatal_error("Failed to mod: " + launch_error);
+    return 0;
+}
