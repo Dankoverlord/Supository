@@ -1,0 +1,263 @@
+#include "../include/mod_base.h"
+
+#include <fstream>
+#include <filesystem>
+#include <vector>
+#include <limits>
+
+namespace fs = std::experimental::filesystem;
+
+ClientOps_t *o;
+
+struct edit_t
+{
+    uint64_t rva;
+    std::vector<uint8_t> expected, new_data;
+
+    edit_t() { }
+    edit_t(edit_t& e) 
+        : rva(e.rva),
+          expected(e.expected),
+          new_data(e.new_data)
+    { }
+    edit_t(edit_t&& e) 
+        : rva(std::move(e.rva)),
+          expected(std::move(e.expected)),
+          new_data(std::move(e.new_data))
+    { }
+};
+
+class ParseError : public std::runtime_error
+{
+public:
+    template <typename... Args>
+    ParseError(const std::string& fmt, Args... args) 
+        : std::runtime_error(Util::FormatString(fmt, args...).c_str()) { }
+};
+
+using PatchEntry = std::pair<std::string, std::vector<edit_t>>;
+std::vector<PatchEntry> patches;
+
+struct parser_t
+{
+    int line_number = 1;
+    std::ifstream& in;
+};
+
+char parse_char(parser_t& p)
+{
+    char c;
+    while (true)
+    {
+        c = p.in.get();
+        if (c == EOF)
+            return 0;
+        if (c == ' ' || c == '\t' || c == '\r')
+            continue;
+        if (c == '\n')
+        {
+            p.line_number++;
+            continue;
+        }
+        if (c == '#')
+        {
+            p.in.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+            continue;
+        }
+        return c;
+    }
+}
+
+char peek_char(parser_t& p)
+{
+    char c = parse_char(p);
+    if (c)
+        p.in.putback(c);
+    return c;
+}
+
+bool parse_hexadecimal(parser_t& p, uint64_t& out)
+{
+    char c;
+    std::string s;
+    while (true)
+    {
+        c = peek_char(p);
+        if (!c)
+            return false;
+        if ((c >= '0' && c <= '9') ||
+            (c >= 'a' && c <= 'f') ||
+            (c >= 'A' && c <= 'F'))
+            s.push_back(parse_char(p));
+        else
+            break;
+    }
+    if (s.empty())
+        throw ParseError("Unexpected character \'{}\' when parsing hexadecimal value.", c);
+    try
+    {
+        uint64_t rv = std::stoull(s, nullptr, 16);
+        out = rv;
+        return true;
+    }
+    catch (const std::invalid_argument& e)
+    {
+        throw ParseError("Unable to parse string \"{}\" as hexadecimal value.", s);
+    }
+    catch (const std::out_of_range& e)
+    {
+        throw ParseError("\"{}\" out of range of 64-bit unsigned integer.", s);
+    }
+}
+
+bool parse_byte(parser_t& p, uint8_t& out)
+{
+    std::string s;
+    for (int i = 0; i < 2; i++)
+    {
+        char c = peek_char(p);
+        if (!c)
+            return false;
+        if ((c >= '0' && c <= '9') ||
+            (c >= 'a' && c <= 'f') ||
+            (c >= 'A' && c <= 'F'))
+            s.push_back(parse_char(p));
+        else
+            throw ParseError("Unexpected character \'{}\' when parsing byte.", c);
+    }
+    try
+    {
+        uint32_t rv = std::stoul(s, nullptr, 16);
+        out = rv;
+        return true;
+    }
+    catch (const std::invalid_argument& e)
+    {
+        throw ParseError("Unable to parse string \"{}\" as byte value.", s);
+    }
+}
+
+bool expect(parser_t& p, char ex)
+{
+    char c = parse_char(p);
+    if (c == 0)
+        throw ParseError("Unexpected end of file (expected {}).", ex);
+    if (c != ex)
+        throw ParseError("Unexpected character {} (expected {}).", c, ex);
+    return true;
+}
+
+void parse_bytebuf(parser_t& p, std::vector<uint8_t>& buf)
+{
+    char c;
+    while (c = peek_char(p), c != ':' && c != '}')
+    {
+        uint8_t b;
+        parse_byte(p, b);
+        buf.push_back(b);
+    }
+    if (buf.empty())
+        throw ParseError("Empty buffer.");
+}
+
+bool parse_edit(parser_t& p, edit_t& e)
+{
+    // done if next character is EOF
+    if (peek_char(p) == 0)
+        return false;
+    
+    uint64_t rva;
+    parse_hexadecimal(p, rva);
+
+    expect(p, '{');
+    std::vector<std::vector<uint8_t>> bufs;
+    bufs.emplace_back();
+    parse_bytebuf(p, bufs.back());
+    if (peek_char(p) == ':')
+    {
+        parse_char(p);
+        bufs.emplace_back();
+        parse_bytebuf(p, bufs.back());
+        if (bufs[0].size() != bufs[1].size())
+            throw ParseError("Check buffer differs in size with patch buffer.");
+    }
+
+    expect(p, '}');
+
+    e.rva = rva;
+    if (bufs.size() == 2)
+    {
+        e.expected = std::move(bufs[0]);
+        e.new_data = std::move(bufs[1]);
+    }
+    else
+    {
+        e.new_data = std::move(bufs[0]);
+    }
+    return true;
+}
+
+void OnLoad(ClientOps_t *ops)
+{
+    o = ops;
+    fs::path patch_dir(ops->moddirectory());
+    patch_dir = patch_dir / "patches";
+    if (!fs::exists(patch_dir))
+        fs::create_directories(patch_dir);
+    if (!fs::is_directory(patch_dir))
+    {
+        Log(ops, "FATAL ERROR: Patch directory path ({}) leads to a file!", patch_dir.string());
+        return;
+    }
+
+    for (auto& file : fs::directory_iterator(patch_dir))
+    {
+        if (file.path().extension() != ".patch")
+            continue;
+
+        std::ifstream in;
+        in.open(file.path().string());
+        if (!in)
+        {
+            Log(ops, "Unable to open patch {}; skipping.", file.path().stem());
+            continue;
+        }
+
+        parser_t parser{1, in};
+        try
+        {
+            PatchEntry p(file.path().stem().string(), {});
+            edit_t edit;
+            while (parse_edit(parser, edit))
+                p.second.push_back(std::move(edit));
+            Log(ops, "Loaded patch {} containing {} edit(s).", p.first, p.second.size());
+            patches.push_back(std::move(p));
+        }
+        catch (const ParseError& e)
+        {
+            Log(ops, "{}:{}: Parse error: {}", file.path().filename().string(), parser.line_number, e.what());
+        }
+    }
+
+    for (auto& patch : patches)
+    {
+        bool skip = false;
+        for (size_t i = 0; i < patch.second.size(); i++)
+        {
+            const edit_t& e = patch.second[i];
+            if (e.expected.size() > 0 && 
+                !ops->validatepatch(e.rva, e.expected.data(), e.expected.size()))
+            {
+                Log(ops, "Skipping patch {} (mismatch in edit {} expected data)", patch.first, i+1);
+                skip = true;
+                break;
+            }
+        }
+        if (skip) continue;
+
+        // all edits in this patch have been validated
+        for (auto& edit : patch.second)
+            ops->patch(edit.rva, edit.new_data.data(), edit.new_data.size());
+        Log(ops, "Applied {} edit(s) from patch {}.", patch.second.size(), patch.first);
+    }
+}
